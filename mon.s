@@ -142,60 +142,46 @@ CALL_SET_TIMER:
 ** 入力：d1.l（チャンネル）
 ** チャネル ch の送信キューからデータを一つ取り出し，実際に送信	
 INTERPUT:
-	movem.l %d0-%d2,-(%sp)
+	movem.l %d0-%d2/%a0-%a1,-(%sp)
 	
 	/* (1) */
 	move.w  #0x2700, %sr
 	/* (2) */
 	cmpi.l #0, %d1
-	beq INTERPUT0
+	beq INTERPUT_CH0
 	cmpi.l #1, %d1
-	beq INTERPUT1
+	beq INTERPUT_CH1
 	bra End_INTERPUT		|ch=0,1以外なら何もしない
-INTERPUT0:	
+INTERPUT_CH0:	
 	/* (3) */
 	moveq	#1, %d0
+	lea.l UTX1, %a0
+	lea.l USTCNT1, %a1
+	bra INTERPUT_COMMON
+INTERPUT_CH1;
+	moveq	#1, %d0
+	lea.l UTX2, %a0
+	lea.l USTCNT2, %a1
+INTERPUT_COMMON:
 	jsr	OUTQ			|送信キューからデータを一つ取り出し
 	*出力１：d0(失敗 0/ 成功 1 )
 	*出力２：d1（取り出した8bitデータ）
 	/* (4) */
 	cmpi #0, %d0
-	beq INTERPUT_MASK0		|取り出し失敗なら、送信割り込みをマスク（禁止）
+	beq INTERPUT_MASK		|取り出し失敗なら、送信割り込みをマスク（禁止）
 	/* (5) */
 	/* d1をUTX1に代入（下位８bit） */
-	ori #0x0800, %D1                | ヘッダを代入
-	move.w %D1, UTX1                | 送信
+	ori #0x0800, %d1                | ヘッダを代入
+	move.w %d1, (%a0)               | 送信
 	bra End_INTERPUT
-INTERPUT_MASK0:
+INTERPUT_MASK:
 	/* (4)' */		|送信失敗した場合、送信割り込み禁止
-	move.w	USTCNT1, %d2
+	move.w	(%a1), %d2
 	andi.w	#0xFFFB, %d2	| 0xFFFB = 1111111111111011 
-	move.w	%d2, USTCNT1    | USTCNT1のTXEEを0にする 
-	bra End_INTERPUT
-INTERPUT1:	
-	/* (3) */
-	moveq	#3, %d0
-	jsr	OUTQ			|送信キューからデータを一つ取り出し
-	*出力１：d0(失敗 0/ 成功 1 )
-	*出力２：d1（取り出した8bitデータ）
-	/* (4) */
-	cmpi #0, %d0
-	beq	INTERPUT_MASK1		|取り出し失敗なら、送信割り込みをマスク（禁止）
-	/* (5) */
-	/* d1をUTX2に代入（下位８bit） */
-	ori #0x0800, %D1                | ヘッダを代入
-	move.w %D1, UTX2                | 送信
-	bra	End_INTERPUT
-INTERPUT_MASK1:
-	/* (4)' */		|送信失敗した場合、送信割り込み禁止
-	move.w	USTCNT2, %d2
-	andi.w	#0xFFFB, %d2	| 0xFFFB = 1111111111111011 
-	move.w	%d2, USTCNT2    | USTCNT2のTXEEを0にする 
+	move.w	%d2, (%a1)    | USTCNT1のTXEEを0にする 
 End_INTERPUT:
-	movem.l (%sp)+, %d0-%d2
+	movem.l (%sp)+, %d0-%d2/%a0-%a1
 	rts
-
-	
 ******************************************************************************************************	
 
 *********PUTSTRING************************************************************************************
@@ -206,26 +192,32 @@ End_INTERPUT:
 ** 出力  ：実際に送信したデータ数 sz → %D0.L
 	
 PUTSTRING:
-	movem.l %d1-%d6/%a0,-(%sp)
+	movem.l %d1-%d6/%a0-%a1,-(%sp)
 	/* (1) */
 	cmpi.l #0, %d1		
-	beq PUTSTRING0
+	beq PUTSTRING_CH0
 	cmpi.l #1, %d1
-	beq PUTSTRING1
+	beq PUTSTRING_CH1
 	bra	End_PUTSTRING	| ch=0,1以外なら何もしない
-PUTSTRING0:
+PUTSTRING_CH0:
+    moveq #1, %d0
+	lea.l USTCNT1, %a1
+	bra PUTSTRING_COMMON
+PUTSTRING_CH1:
+    moveq #3, %d0
+	lea.l USTCNT2, %a1
+PUTSTRING_COMMON:
 	/* (2) */
 	moveq	#0, %d4  	| d4 = sz = 0 
 	movea.l	%d2, %a0 	| a0 = i = p 
 	/* (3) */
 	cmpi 	#0, %d3		| 送信サイズが０のとき
-	beq	PUTSTRING0_10
-LOOP_PUTSTRING0:	
+	beq	PUTSTRING_10
+LOOP_PUTSTRING:	
 	/* (4) */
 	cmp	%d3, %d4	| 送信サイズ == 送信した数？
 	beq	PUTSTRING0_9
 	/* (5) */
-	moveq	#1, %d0
 	move.b	(%a0), %d1	| a0:データ読み込み先の先頭アドレス
 	jsr	INQ
 	*d0 :キュー番号
@@ -233,58 +225,22 @@ LOOP_PUTSTRING0:
 	*出力：d0(失敗 0/ 成功 1 )
 	/* (6) */
 	cmpi 	#0, %d0		| INQ失敗？
-	beq	PUTSTRING0_9	
+	beq	PUTSTRING_9	
 	/* (7) */
 	addq	#1, %d4		| 送信した数に１を足す
 	addq	#1, %a0		| 読み込むデータを次に
 	/* (8) */
-	bra 	LOOP_PUTSTRING0	| 全て送信 or INQ失敗まで続ける
+	bra 	LOOP_PUTSTRING | 全て送信 or INQ失敗まで続ける
 PUTSTRING0_9:
 	/* (9) */
-	move.w	USTCNT1, %d6
+	move.w	(%a1), %d6
 	ori.w	#0x0004, %d6	| 0xFFFB = 0000000000000100 
-	move.w	%d6,	USTCNT1 | 送信割込み許可 
+	move.w	%d6, (%a1)      | 送信割込み許可 
 PUTSTRING0_10:
 	/* (10) */
 	move.l	%d4, %d0	| d0(出力) = sz(送信した数)
-	bra End_PUTSTRING
-	
-PUTSTRING1:
-	/* (2) */
-	moveq	#0, %d4  	| d4 = sz = 0 
-	movea.l	%d2, %a0 	| a0 = i = p 
-	/* (3) */
-	cmpi 	#0, %d3		| 送信サイズが０のとき
-	beq	PUTSTRING1_10
-LOOP_PUTSTRING1:	
-	/* (4) */
-	cmp	%d3, %d4	| 送信サイズ == 送信した数？
-	beq	PUTSTRING1_9
-	/* (5) */
-	moveq	#3, %d0
-	move.b	(%a0), %d1	| a0:データ読み込み先の先頭アドレス
-	jsr	INQ
-	*d0 :キュー番号
-	*d1 :8bitデータ
-	*出力：d0(失敗 0/ 成功 1 )
-	/* (6) */
-	cmpi 	#0, %d0		| INQ失敗？
-	beq	PUTSTRING1_9	
-	/* (7) */
-	addq	#1, %d4		| 送信した数に１を足す
-	addq	#1, %a0		| 読み込むデータを次に
-	/* (8) */
-	bra 	LOOP_PUTSTRING1	| 全て送信 or INQ失敗まで続ける
-PUTSTRING1_9:
-	/* (9) */
-	move.w	USTCNT2, %d6
-	ori.w	#0x0004, %d6	| 0xFFFB = 0000000000000100 
-	move.w	%d6, USTCNT2    | 送信割込み許可 
-PUTSTRING1_10:
-	/* (10) */
-	move.l	%d4, %d0	| d0(出力) = sz(送信した数)
 End_PUTSTRING:
-	movem.l (%sp)+, %d1-%d6/%a0
+	movem.l (%sp)+, %d1-%d6/%a0-%a1
 	rts
 	
 ******************************************************************************************************
@@ -440,18 +396,15 @@ QUEUE3: .ds.b Q_STRIDE
 /* 受信レジスタの値はすでにd2に格納されている。あとは送信キューに入れるだけ。（河野） */	
 INTERGET:
 	cmpi.l #0, %d1    /* ch != 0,1 なら終了 */
-	beq INTERGET0
+	beq INTERGET_CH0
 	cmpi.l #1, %d1
-	beq INTERGET1                 
-	bra INTERGET_END 
-INTERGET0:	
-        move.b %d2, %d1   /* %d1 = data */
+	bne INTERGET_END
+	moveq.l #2, %d0
+	bra INTERGET_DO 
+INTERGET_CH0:	
 	moveq.l #0, %d0   /* キュー番号を 0 に設定 */          
-	jsr INQ           /* INQ(0, data) */
-	bra INTERGET_END
-INTERGET1:
-        move.b %d2, %d1   /* %d1 = data */
-	moveq.l #2, %d0   /* キュー番号を 2 に設定 */          
+INTERGET_DO:
+    move.b %d2, %d1   /* %d1 = data */
 	jsr INQ           /* INQ(2, data) */
 INTERGET_END:
 	rts
@@ -466,47 +419,29 @@ INTERGET_END:
 GETSTRING:
 	movem.l %d4/%a0, -(%sp)
 	cmp.l #0, %d1            /* ch != 0,1 なら終了 */
-	beq GETSTRING0
-	cmp.l #0, %d1       
-	beq GETSTRING1       
+	beq GETSTRING_CH0
+	cmp.l #1, %d1       
+	beq GETSTRING_CH1       
 	bra GETSTRING_END
-GETSTRING0:
-	moveq.l #0, %d4          /* %d4 = 0 , %d4は%d0(=sz)の一時保存レジスタ */                    
-	movea.l %d2, %a0         /* %a0 = p */       
-
-GETSTRING0_STEP1:
+GETSTRING_CH0:
+	moveq.l #0, %d0          /* %d0 = 0, キュー番号を0に */                  
+	bra GETSTRING_COMMON	
+GETSTRING_CH1:
+	movea.l %d2, %d0         /* %d0 = 2, キュー番号を2に */
+GETSTRING0_COMMON:
+	moveq.l #0, %d4
+	movea.l %d2, %a0
+GETSTRING_LOOP:
 	cmp.l %d4, %d3           /* %d4 = size なら STEP2 へ */               
-	beq GETSTRING0_STEP2
-	moveq.l #0, %d0          /* %d0 = 0, キュー番号を0に */
+	beq GETSTRING0_END
 	jsr OUTQ                 /* OUTQ(0,data) */      
 	cmpi.l #0, %d0           /* 復帰値 %d0 が 0 なら STEP2 へ */           
-	beq GETSTRING0_STEP2      
+	beq GETSTRING0_END      
 	move.b %d1, (%a0)+       /* %a0 番地へ data をコピー, %a0++ */                               
 	addq.l #1, %d4           /* %d4++ */      
-	bra GETSTRING0_STEP1      
-
-GETSTRING0_STEP2:
+	bra GETSTRING0_LOOP  
+GETSTRING0_END:
 	move.l %d4, %d0          /* %d0 = %d4 */  
-
-GETSTRING1:
-	moveq.l #0, %d4          /* %d4 = 0 , %d4は%d0(=sz)の一時保存レジスタ */                    
-	movea.l %d2, %a0         /* %a0 = p */       
-
-GETSTRING1_STEP1:
-	cmp.l %d4, %d3           /* %d4 = size なら STEP2 へ */               
-	beq GETSTRING1_STEP2
-	moveq.l #2, %d0          /* %d0 = 2, キュー番号を2に */
-	jsr OUTQ                 /* OUTQ(0,data) */      
-	cmpi.l #0, %d0           /* 復帰値 %d0 が 0 なら STEP2 へ */           
-	beq GETSTRING1_STEP2      
-	move.b %d1, (%a0)+       /* %a0 番地へ data をコピー, %a0++ */                               
-	addq.l #1, %d4           /* %d4++ */      
-	bra GETSTRING1_STEP1      
-
-GETSTRING1_STEP2:
-	move.l %d4, %d0          /* %d0 = %d4 */ 
-	
-GETSTRING_END:
 	movem.l (%sp)+, %d4/%a0
 	rts
 /*; ---- end include interget.s ----*/
