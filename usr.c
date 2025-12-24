@@ -1,280 +1,104 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include "mtk_c.h"
 
-/* --- ハードウェア定義 (環境に合わせて調整) --- */
-#define REGBASE 0xfff000
-volatile unsigned short *USTCNT1 = (unsigned short *)(REGBASE + 0x900);
-volatile unsigned short *URX1    = (unsigned short *)(REGBASE + 0x904);
-volatile unsigned short *USTCNT2 = (unsigned short *)(REGBASE + 0x940); // ※要確認
-volatile unsigned short *URX2    = (unsigned short *)(REGBASE + 0x944); // ※要確認
+#define TERMINAL_HEIGHT 24
 
-/* --- ゲーム設定 --- */
-#define WIDTH  20
-#define HEIGHT 15
-#define PADDLE_W 3
-#define GOAL_SCORE 3
+// ANSIシーケンス
+#define CLS            "\x1b[2J"
+#define SET_SCROLL     "\x1b[1;23r" 
+#define SAVE_CURSOR    "\x1b[s"
+#define RESTORE_CURSOR "\x1b[u"
+#define GOTO_INPUT_ROW "\x1b[24;1H" 
+#define ERASE_LINE     "\x1b[K"      // カーソル位置から行末まで消去
 
-/* キー定義 */
-#define KEY_SWITCH ' '  // 方向転換
-#define KEY_RESET  'r'  // 強制リセット
+extern char inbyte(unsigned int ch);
 
-/* ANSI エスケープシーケンス */
-#define ESC "\x1b"
-#define CLS "\x1b[2J"
-#define HIDE_CURSOR "\x1b[?25l"
-#define COLOR_RESET "\x1b[0m"
-#define COLOR_BALL  "\x1b[33m" // 黄
-#define COLOR_P1    "\x1b[36m" // シアン
-#define COLOR_P2    "\x1b[35m" // マゼンタ
-#define COLOR_WALL  "\x1b[37m" // 白
-
-/* グローバルゲーム状態 */
-typedef struct {
-    int x, y;           // ボール位置
-    int vx, vy;         // ボール速度
-    int old_x, old_y;   // 前回位置（消去用）
-} Ball;
-
-typedef struct {
-    int x;              // パドル左端位置 (yは固定)
-    int dir;            // 移動方向 (1:右, -1:左)
-    int old_x;          // 前回位置
-    int score;
-} Paddle;
-
-/* 共有データ */
-Ball ball;
-Paddle p1, p2; // P1は y=HEIGHT-2, P2は y=1
-int game_state; // 0:待機, 1:プレイ中, 2:終了
-int hit_count;  // 反射回数（速度調整用）
-int winner;
-
-/* --- 関数: 入出力 --- */
-
-/* 座標移動 (P2は180度回転して出力) */
-void term_goto(FILE *fp, int id, int x, int y) {
-    if (id == 0) {
-        // P1: 通常視点
-        fprintf(fp, "\x1b[%d;%dH", y + 1, x + 1);
-    } else {
-        // P2: 反転視点 (xもyも逆)
-        fprintf(fp, "\x1b[%d;%dH", (HEIGHT - 1 - y) + 1, (WIDTH - 1 - x) + 1);
-    }
+// ログ出力関数
+void write_log(FILE *target_fp, const char *user_name, const char *message) {
+    fprintf(target_fp, SAVE_CURSOR);
+    // 1-23行目の範囲でスクロールさせるための特殊な動き
+    fprintf(target_fp, "\x1b[23;1H"); // 23行目へ移動
+    fprintf(target_fp, "\n");         // ここでスクロール発生（1-23行目のみ動く）
+    fprintf(target_fp, "\x1b[23;1H"); // 再度23行目へ
+    fprintf(target_fp, "\x1b[K");      // その行を掃除
+    fprintf(target_fp, "%s: %s", user_name, message);
+    fprintf(target_fp, RESTORE_CURSOR);
 }
 
-/* 文字描画 */
-void term_put(FILE *fp, int id, int x, int y, char *c) {
-    term_goto(fp, id, x, y);
-    fprintf(fp, "%s", c);
-} 
+// プレビュー表示付き my_read
+int my_read_with_echo(int fd, char *buf, int nbytes, FILE *out_fp) {
+    char c;
+    int i, ch;
+    if (fd == 0 || fd == 3) ch = 0;
+    else if (fd == 4) ch = 1;
+    else return -1;
 
-/* --- ゲームロジック --- */
-
-void init_round() {
-    ball.x = WIDTH / 2;
-    ball.y = HEIGHT / 2;
-    ball.vx = (rand() % 2 == 0) ? 1 : -1;
-    ball.vy = (hit_count % 2 == 0) ? 1 : -1;
-    ball.old_x = ball.x;
-    ball.old_y = ball.y;
-
-    p1.x = WIDTH / 2 - 1; p1.dir = 1; p1.old_x = p1.x;
-    p2.x = WIDTH / 2 - 1; p2.dir = 1; p2.old_x = p2.x;
-    
-    hit_count = 0;
-}
-
-void draw_frame_static(FILE *fp, int id) {
-    fprintf(fp, CLS);
-    fprintf(fp, HIDE_CURSOR);
-    
-    // 枠描画
-    term_put(fp, id, 0, 0, COLOR_WALL, "+");
-    for(int i=1; i<WIDTH-1; i++) fprintf(fp, "-");
-    fprintf(fp, "+");
-
-    // スコア表示
-    term_goto(fp, id, 2, HEIGHT+1); // 画面外下部
-    fprintf(fp, COLOR_RESET "1P: %d  2P: %d", p1.score, p2.score);
-}
-
-/* 差分描画システム*/
-void update_view(int id) {
-    FILE *fp = (id == 0) ? com0out : com1out;
-    
-    // 1. ボールの消去と描画
-    if (ball.x != ball.old_x || ball.y != ball.old_y) {
-        term_put(fp, id, ball.old_x, ball.old_y, COLOR_RESET, " "); // 消す
-        term_put(fp, id, ball.x, ball.y, COLOR_BALL, "O");          // 描く
-    }
-
-    // 2. パドルの消去と描画 (P1)
-    if (p1.x != p1.old_x) {
-        // P1は論理座標 y = HEIGHT - 2
-        for(int i=0; i<PADDLE_W; i++) 
-            term_put(fp, id, p1.old_x + i, HEIGHT - 2, COLOR_RESET, " ");
-        for(int i=0; i<PADDLE_W; i++) 
-            term_put(fp, id, p1.x + i, HEIGHT - 2, (id==0)?COLOR_P1:COLOR_P2, "=");
-    }
-
-    // 3. パドルの消去と描画 (P2)
-    if (p2.x != p2.old_x) {
-        // P2は論理座標 y = 1
-        for(int i=0; i<PADDLE_W; i++) 
-            term_put(fp, id, p2.old_x + i, 1, COLOR_RESET, " ");
-        for(int i=0; i<PADDLE_W; i++) 
-            term_put(fp, id, p2.x + i, 1, (id==1)?COLOR_P1:COLOR_P2, "=");
-    }
-}
-
-void move_paddle(Paddle *p) {
-    p->old_x = p->x;
-    p->x += p->dir;
-    
-    // 壁反射
-    if (p->x < 1) {
-        p->x = 1;
-        p->dir = 1; // 強制反転
-    }
-    if (p->x > WIDTH - 1 - PADDLE_W) {
-        p->x = WIDTH - 1 - PADDLE_W;
-        p->dir = -1;
-    }
-}
-
-void update_physics() {
-    ball.old_x = ball.x;
-    ball.old_y = ball.y;
-    
-    ball.x += ball.vx;
-    ball.y += ball.vy;
-
-    // 壁反射 (左右)
-    if (ball.x <= 0 || ball.x >= WIDTH - 1) {
-        ball.vx = -ball.vx;
-        ball.x += ball.vx; // めり込み防止
-    }
-
-    // P2パドル判定 (y=1付近)
-    if (ball.y == 1) {
-        if (ball.x >= p2.x && ball.x < p2.x + PADDLE_W) {
-            ball.vy = 1; // 下へ弾く
-            hit_count++;
-            // ランダム反射
-            ball.vx = (rand() % 3) - 1; // -1, 0, 1
-            if (ball.vx == 0) ball.vx = (rand()%2)?1:-1; // 0回避
+    for (i = 0; i < nbytes - 1; i++) {
+        c = inbyte(ch);
+        
+        if (c == '\r' || c == '\n') {
+            buf[i] = '\0';
+            return i; // 確定して戻る
+        } else if (c == '\x7f' || c == '\x08') { // Backspace処理
+            if (i > 0) {
+                i -= 2; 
+                fprintf(out_fp, "\b \b");
+            } else {
+                i = -1;
+            }
+            continue;
+        } else {
+            buf[i] = c;
+            fputc(c, out_fp); // 入力中のプレビュー表示
         }
     }
-    
-    // P1パドル判定 (y=HEIGHT-2付近)
-    if (ball.y == HEIGHT - 2) {
-        if (ball.x >= p1.x && ball.x < p1.x + PADDLE_W) {
-            ball.vy = -1; // 上へ弾く
-            hit_count++;
-            ball.vx = (rand() % 3) - 1;
-            if (ball.vx == 0) ball.vx = (rand()%2)?1:-1;
-        }
-    }
-
-    // 得点判定
-    if (ball.y <= 0) {
-        p1.score++; // P2が落とした
-        init_round();
-        draw_frame_static(com0out, 0); // 画面リフレッシュ
-        draw_frame_static(com1out, 1);
-    }
-    else if (ball.y >= HEIGHT - 1) {
-        p2.score++; // P1が落とした
-        init_round();
-        draw_frame_static(com0out, 0);
-        draw_frame_static(com1out, 1);
-    }
+    return i;
 }
 
-/* メインタスク (ゲーム管理) */
 void task1() {
-    // コンソール初期化
-    game_state = 0;
-    p1.score = 0; p2.score = 0;
-    
-    fprintf(com0out, CLS "PRESS SPACE TO START\n");
-    fprintf(com1out, CLS "PRESS SPACE TO START\n");
+    char line[256];
+    // 初期設定
+    fprintf(com0out, CLS SET_SCROLL GOTO_INPUT_ROW "> ");
 
-    while(1) {
-        // --- 入力処理 (ノンブロッキング) ---
-        char c1 = inkey(0);
-        char c2 = inkey(1);
+    while (1) {
+        // 入力完了（Enter）まで待機
+        int len = my_read_with_echo(0, line, 256, com0out);
 
-        if (game_state == 0) {
-            // 待機画面
-            if (c1 == KEY_SWITCH || c2 == KEY_SWITCH) {
-                game_state = 1;
-                init_round();
-                draw_frame_static(com0out, 0);
-                draw_frame_static(com1out, 1);
-            }
-            continue;
+        if (len > 0) {
+            // ログを表示
+            write_log(com0out, "user1", line);
+            write_log(com1out, "user1", line);
         }
-        else if (game_state == 2) {
-            // 勝利画面
-            if (c1 == KEY_SWITCH || c2 == KEY_SWITCH) {
-                p1.score = 0; p2.score = 0;
-                game_state = 0;
-                fprintf(com0out, CLS "RESTART? PRESS SPACE\n");
-                fprintf(com1out, CLS "RESTART? PRESS SPACE\n");
-            }
-            continue;
-        }
-        // 勝敗判定
-        if (p1.score >= GOAL_SCORE || p2.score >= GOAL_SCORE) {
-            game_state = 2;
-            winner = (p1.score >= GOAL_SCORE) ? 1 : 2;
-            
-            fprintf(com0out, CLS "\x1b[10;10H %s \n", (winner==1)?"YOU WIN!":"YOU LOSE");
-            fprintf(com1out, CLS "\x1b[10;10H %s \n", (winner==2)?"YOU WIN!":"YOU LOSE");
-        }
+
+        // --- ここでプレビューを消去 ---
+        // 24行目に移動し、行末まで消してプロンプトを再描画
+        fprintf(com0out, GOTO_INPUT_ROW ERASE_LINE "> ");
     }
 }
 
 void task2() {
-    while(1){
-        char c1 = inkey(0);
-        if (c1 == KEY_SWITCH) p1.dir *= -1;
-        move_paddle(&p1);
-    }
-}
+    char line[256];
+    fprintf(com1out, CLS SET_SCROLL GOTO_INPUT_ROW "> ");
 
-void task3() {
-    while(1){
-        char c2 = inkey(1);
-        if (c2 == KEY_SWITCH) p2.dir *= -1;
-        move_paddle(&p2);
-    }
-}
+    while (1) {
+        int len = my_read_with_echo(4, line, 256, com1out);
 
-void task4() {
-    while(1){
-        if(game_state == 1){
-            update_physics();
-            update_view(0);
-            update_view(1);
+        if (len > 0) {
+            write_log(com0out, "user2", line);
+            write_log(com1out, "user2", line);
         }
-        int wait = 150 - (hit_count * 5);
-        if (wait < 30) wait = 30; // 最速リミット
-        for (int i = 0; i < wait*10000; i++);
+
+        // プレビュー消去
+        fprintf(com1out, GOTO_INPUT_ROW ERASE_LINE "> ");
     }
 }
 
-
-/* main.c の代わり */
 int main() {
-    init_kernel();
     fd_mapping();
+    init_kernel();
+    
     set_task(task1);
     set_task(task2);
-    set_task(task3);
-    set_task(task4);
 
     begin_sch();
     return 0;
