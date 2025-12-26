@@ -7,6 +7,7 @@
 #define MAX_NAME 16
 #define MAX_MSG 256
 
+extern char inkey(unsigned int ch);
 /* ユーザー情報 */
 typedef struct {
     char name[MAX_NAME];
@@ -51,7 +52,7 @@ int total_messages_sent = 0;
 void send_message(User *sender, const char *msg) {
     char buf[512];
     int pos = 0;
-    
+
     /* 両方の画面の入力行を消去してからメッセージ表示 */
     pos += sprintf(buf + pos, "\r\x1b[2K");
     pos += sprintf(buf + pos, "%s%s: \x1b[0m%s\n", sender->color, sender->name, msg);
@@ -59,39 +60,37 @@ void send_message(User *sender, const char *msg) {
     /* 一度に出力 */
     fprintf(com0out, "%s", buf);
     fprintf(com1out, "%s", buf);
-    
-    /* プロンプトを再表示（入力中だった場合は入力内容も） */
+    fprintf(com0out, "\x1b[K");
+    fprintf(com1out, "\x1b[K");
+
+    // User1の画面
     if (user1.is_typing) {
-        redraw_input(com0out, &user1);
+        fprintf(com0out, ">%s", user1.input_buffer);
     } else {
         fprintf(com0out, ">");
     }
-    
+
+    // User2の画面
     if (user2.is_typing) {
-        redraw_input(com1out, &user2);
+        fprintf(com1out, ">%s", user2.input_buffer);
     } else {
         fprintf(com1out, ">");
     }
-    
-    total_messages_sent++;
 }
 
 void handle_command(User *u, FILE *out_fp, const char *cmd) {
-    if (strncmp(cmd, "/name ", 6) == 0) {
-        P(SCREEN_SEM);
-        strncpy(u->name, cmd + 6, MAX_NAME - 1);
+    if (strncmp(cmd, "/rename ", 8) == 0) {
+        strncpy(u->name, cmd + 8, MAX_NAME - 1);
         u->name[MAX_NAME - 1] = '\0';
         
         char buf[128];
-        sprintf(buf, "\r\x1b[2K\x1b[33m[System] Name changed to: %s\x1b[0m\n>", u->name);
+        sprintf(buf, "\r\x1b[2K\x1b[33m[System] Name changed to: %s\x1b[0m\n\x1b[K>", u->name);
         fprintf(out_fp, "%s", buf);
-        V(SCREEN_SEM);
     }
     else if (strncmp(cmd, "/color ", 7) == 0) {
         const char *color_name = cmd + 7;
         int found = 0;
         
-        P(SCREEN_SEM);
         if (strcmp(color_name, "red") == 0) {
             strcpy(u->color, colors[0]);
             found = 1;
@@ -117,25 +116,20 @@ void handle_command(User *u, FILE *out_fp, const char *cmd) {
         
         if (found) {
             char buf[128];
-            sprintf(buf, "\r\x1b[2K\x1b[33m[System] Color changed to: %s\x1b[0m\n>", color_name);
+            sprintf(buf, "\r\x1b[2K\x1b[33m[System] Color changed to: %s\x1b[0m\x1b[K>", color_name);
             fprintf(out_fp, "%s", buf);
         } else {
             fprintf(out_fp, "\r\x1b[2K\x1b[33m[System] Unknown color. Available: red, green, yellow, blue, magenta, cyan, white\x1b[0m\n>");
         }
-        V(SCREEN_SEM);
     }
     else if (strcmp(cmd, "/help") == 0) {
-        P(SCREEN_SEM);
         fprintf(out_fp, "\r\x1b[2K\x1b[33m[System] Commands:\x1b[0m\n");
-        fprintf(out_fp, "  /name <name> - Change your name\n");
-        fprintf(out_fp, "  /color <color> - Change your color\n");
+        fprintf(out_fp, "  /rename <name> - Change your name\n");
+        fprintf(out_fp, "  /color <color> - Change your color\n                   {green, yellow, blue, magenta, cyan, white}\n");
         fprintf(out_fp, "  /help - Show this help\n>");
-        V(SCREEN_SEM);
     }
     else {
-        P(SCREEN_SEM);
         fprintf(out_fp, "\r\x1b[2K\x1b[33m[System] Unknown command. Type /help for commands\x1b[0m\n>");
-        V(SCREEN_SEM);
     }
 }
 
@@ -149,6 +143,7 @@ void task1() {
     
     /* 名前入力 */
     int name_idx = 0;
+    P(3);
     while (1) {
         input_char = fgetc(com0in);
         if (input_char == '\n' || input_char == '\r') {
@@ -161,15 +156,12 @@ void task1() {
             }
         } else if (input_char >= 32 && input_char <= 126 && name_idx < MAX_NAME - 1) {
             user1.name[name_idx++] = input_char;
-            fprintf(com0out, "%c", input_char);
         }
     }
     
-    fprintf(com0out, "\x1b[33mWelcome, %s!\x1b[0m\n", user1.name);
-    fprintf(com0out, "Type /help for commands\n>");
-    
-    system_ready = 1;
-    
+    fprintf(com0out, "\x1b[33mWelcome, %s!\x1b[0m\n>", user1.name);
+    V(3);
+    P(4);
     while (1) {
         input_char = fgetc(com0in);
         
@@ -180,21 +172,19 @@ void task1() {
                 user1.input_buffer[user1.input_pos] = '\0';
                 user1.is_typing = 0;
                 
+                P(SCREEN_SEM);
+                fprintf(com0out, "\r\x1b[A\x1b[2K");
                 if (user1.input_buffer[0] == '/') {
                     /* コマンド実行（自分の画面のみ消去） */
-                    P(SCREEN_SEM);
-                    fprintf(com0out, "\r\x1b[2K");
-                    V(SCREEN_SEM);
                     handle_command(&user1, com0out, user1.input_buffer);
                 } else {
                     /* メッセージ送信（send_message内で両画面消去） */
-                    P(SCREEN_SEM);
                     send_message(&user1, user1.input_buffer);
-                    V(SCREEN_SEM);
                 }
                 
                 user1.input_pos = 0;
                 user1.input_buffer[0] = '\0';
+                V(SCREEN_SEM);
             } else {
                 /* 空行の場合はプロンプトだけ再表示 */
                 P(SCREEN_SEM);
@@ -229,17 +219,13 @@ void task1() {
 void task2() {
     char input_char;
     
-    /* system_readyを待つ（待機時間を短く） */
-    while (!system_ready) {
-        for (int i = 0; i < 10000; i++);
-    }
-    
     fprintf(com1out, "\x1b[2J\x1b[H");
     fprintf(com1out, "\x1b[33m=== CHAT SYSTEM ===\x1b[0m\n");
     fprintf(com1out, "\x1b[33mEnter your name > \x1b[0m");
     
     /* 名前入力 */
     int name_idx = 0;
+    P(4);
     while (1) {
         input_char = fgetc(com1in);
         if (input_char == '\n' || input_char == '\r') {
@@ -252,13 +238,12 @@ void task2() {
             }
         } else if (input_char >= 32 && input_char <= 126 && name_idx < MAX_NAME - 1) {
             user2.name[name_idx++] = input_char;
-            fprintf(com1out, "%c", input_char);
         }
     }
     
-    fprintf(com1out, "\x1b[33mWelcome, %s!\x1b[0m\n", user2.name);
-    fprintf(com1out, "Type /help for commands\n>");
-    
+    fprintf(com1out, "\x1b[33mWelcome, %s!\x1b[0m\n>", user2.name);
+    V(4);
+    P(3);
     while (1) {
         input_char = fgetc(com1in);
         
@@ -269,21 +254,19 @@ void task2() {
                 user2.input_buffer[user2.input_pos] = '\0';
                 user2.is_typing = 0;
                 
+                P(SCREEN_SEM);
+                fprintf(com1out, "\r\x1b[A\x1b[2K");
                 if (user2.input_buffer[0] == '/') {
                     /* コマンド実行（自分の画面のみ消去） */
-                    P(SCREEN_SEM);
-                    fprintf(com1out, "\r\x1b[2K");
-                    V(SCREEN_SEM);
                     handle_command(&user2, com1out, user2.input_buffer);
                 } else {
                     /* メッセージ送信（send_message内で両画面消去） */
-                    P(SCREEN_SEM);
                     send_message(&user2, user2.input_buffer);
-                    V(SCREEN_SEM);
                 }
                 
                 user2.input_pos = 0;
                 user2.input_buffer[0] = '\0';
+                V(SCREEN_SEM);
             } else {
                 /* 空行の場合はプロンプトだけ再表示 */
                 P(SCREEN_SEM);
@@ -334,132 +317,7 @@ void task3() {
     }
 }
 
-/* タスク4: システムメッセージ管理 */
-void task4() {
-    int cycle_count = 0;
-    int last_total_messages = 0;
-    int idle_count = 0;
-    int milestone_10 = 0;
-    int milestone_50 = 0;
-    int milestone_100 = 0;
-    
-    /* 起動メッセージ */
-    for (int i = 0; i < 2000000; i++);
-    
-    P(SCREEN_SEM);
-    char buf[256];
-    sprintf(buf, "\r\x1b[2K\x1b[96m[System] Chat session started. Type /help for commands.\x1b[0m\n>");
-    fprintf(com0out, "%s", buf);
-    fprintf(com1out, "%s", buf);
-    V(SCREEN_SEM);
-    
-    while (1) {
-        for (int i = 0; i < 3000000; i++);
-        
-        cycle_count++;
-        
-        P(INPUT_SEM);
-        int current_total = total_messages_sent;
-        int user1_typing = user1.is_typing;
-        int user2_typing = user2.is_typing;
-        V(INPUT_SEM);
-        
-        /* メッセージ数のマイルストーン通知 */
-        if (current_total >= 10 && !milestone_10) {
-            milestone_10 = 1;
-            P(SCREEN_SEM);
-            sprintf(buf, "\r\x1b[2K\x1b[96m[System] 10 messages! Conversation is flowing nicely.\x1b[0m\n");
-            fprintf(com0out, "%s", buf);
-            fprintf(com1out, "%s", buf);
-            
-            if (user1_typing) redraw_input(com0out, &user1);
-            else fprintf(com0out, ">");
-            if (user2_typing) redraw_input(com1out, &user2);
-            else fprintf(com1out, ">");
-            V(SCREEN_SEM);
-        }
-        
-        if (current_total >= 50 && !milestone_50) {
-            milestone_50 = 1;
-            P(SCREEN_SEM);
-            sprintf(buf, "\r\x1b[2K\x1b[96m[System] 50 messages exchanged! You're chatting a lot!\x1b[0m\n");
-            fprintf(com0out, "%s", buf);
-            fprintf(com1out, "%s", buf);
-            
-            if (user1_typing) redraw_input(com0out, &user1);
-            else fprintf(com0out, ">");
-            if (user2_typing) redraw_input(com1out, &user2);
-            else fprintf(com1out, ">");
-            V(SCREEN_SEM);
-        }
-        
-        if (current_total >= 100 && !milestone_100) {
-            milestone_100 = 1;
-            P(SCREEN_SEM);
-            sprintf(buf, "\r\x1b[2K\x1b[93m[System] AMAZING! 100 messages reached! \x1b[0m\n");
-            fprintf(com0out, "%s", buf);
-            fprintf(com1out, "%s", buf);
-            
-            if (user1_typing) redraw_input(com0out, &user1);
-            else fprintf(com0out, ">");
-            if (user2_typing) redraw_input(com1out, &user2);
-            else fprintf(com1out, ">");
-            V(SCREEN_SEM);
-        }
-        
-        /* アイドル状態の検出（メッセージが増えていない） */
-        if (current_total == last_total_messages) {
-            idle_count++;
-        } else {
-            idle_count = 0;
-        }
-        last_total_messages = current_total;
-        
-        /* 20サイクル（約60秒）無活動で通知 */
-        if (idle_count == 20) {
-            P(SCREEN_SEM);
-            sprintf(buf, "\r\x1b[2K\x1b[90m[System] Still there? Say hello!\x1b[0m\n");
-            fprintf(com0out, "%s", buf);
-            fprintf(com1out, "%s", buf);
-            
-            if (user1_typing) redraw_input(com0out, &user1);
-            else fprintf(com0out, ">");
-            if (user2_typing) redraw_input(com1out, &user2);
-            else fprintf(com1out, ">");
-            V(SCREEN_SEM);
-        }
-        
-        /* 40サイクル（約120秒）無活動で統計表示 */
-        if (idle_count == 40) {
-            P(SCREEN_SEM);
-            sprintf(buf, "\r\x1b[2K\x1b[90m[System] Session statistics: %d messages sent.\x1b[0m\n", current_total);
-            fprintf(com0out, "%s", buf);
-            fprintf(com1out, "%s", buf);
-            
-            if (user1_typing) redraw_input(com0out, &user1);
-            else fprintf(com0out, ">");
-            if (user2_typing) redraw_input(com1out, &user2);
-            else fprintf(com1out, ">");
-            V(SCREEN_SEM);
-            
-            idle_count = 0;
-        }
-        
-        /* 30サイクルごとに接続確認メッセージ */
-        if (cycle_count % 30 == 0 && current_total > 5) {
-            P(SCREEN_SEM);
-            sprintf(buf, "\r\x1b[2K\x1b[90m[System] Connection stable. %d messages so far.\x1b[0m\n", current_total);
-            fprintf(com0out, "%s", buf);
-            fprintf(com1out, "%s", buf);
-            
-            if (user1_typing) redraw_input(com0out, &user1);
-            else fprintf(com0out, ">");
-            if (user2_typing) redraw_input(com1out, &user2);
-            else fprintf(com1out, ">");
-            V(SCREEN_SEM);
-        }
-    }
-}
+
 
 int main() {
     printf("CHAT SYSTEM INITIALIZING\n");
@@ -485,7 +343,6 @@ int main() {
     set_task(task1);
     set_task(task2);
     set_task(task3);
-    set_task(task4);
     
     printf("[OK] All tasks set\n");
     
