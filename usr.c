@@ -1,105 +1,309 @@
 #include <stdio.h>
+#include <string.h>
 #include "mtk_c.h"
 
-#define TERMINAL_HEIGHT 24
+#define SCREEN_SEM 0
+#define INPUT_SEM 1
+#define MAX_NAME 16
+#define MAX_MSG 256
 
-// ANSIシーケンス
-#define CLS            "\x1b[2J"
-#define SET_SCROLL     "\x1b[1;23r" 
-#define SAVE_CURSOR    "\x1b[s"
-#define RESTORE_CURSOR "\x1b[u"
-#define GOTO_INPUT_ROW "\x1b[24;1H" 
-#define ERASE_LINE     "\x1b[K"      // カーソル位置から行末まで消去
+/* ユーザー情報 */
+typedef struct {
+    char name[MAX_NAME];
+    char color[8];
+    char input_buffer[MAX_MSG];
+    int input_pos;
+    int is_typing;
+} User;
 
-extern char inbyte(unsigned int ch);
+User user1, user2;
+int system_ready = 0;
 
-// ログ出力関数
-void write_log(FILE *target_fp, const char *user_name, const char *message) {
-    fprintf(target_fp, SAVE_CURSOR);
-    // 1-23行目の範囲でスクロールさせるための特殊な動き
-    fprintf(target_fp, "\x1b[23;1H"); // 23行目へ移動
-    fprintf(target_fp, "\n");         // ここでスクロール発生（1-23行目のみ動く）
-    fprintf(target_fp, "\x1b[23;1H"); // 再度23行目へ
-    fprintf(target_fp, "\x1b[K");      // その行を掃除
-    fprintf(target_fp, "%s: %s", user_name, message);
-    fprintf(target_fp, RESTORE_CURSOR);
+/* 色コード定義 */
+const char *colors[] = {
+    "\x1b[31m", /* red */
+    "\x1b[32m", /* green */
+    "\x1b[33m", /* yellow */
+    "\x1b[34m", /* blue */
+    "\x1b[35m", /* magenta */
+    "\x1b[36m", /* cyan */
+    "\x1b[37m"  /* white */
+};
+
+void init_user(User *u, const char *default_name, const char *default_color) {
+    strcpy(u->name, default_name);
+    strcpy(u->color, default_color);
+    u->input_buffer[0] = '\0';
+    u->input_pos = 0;
+    u->is_typing = 0;
 }
 
-// プレビュー表示付き my_read
-int my_read_with_echo(int fd, char *buf, int nbytes, FILE *out_fp) {
-    char c;
-    int i, ch;
-    if (fd == 0 || fd == 3) ch = 0;
-    else if (fd == 4) ch = 1;
-    else return -1;
+void clear_input_line(FILE *fp) {
+    fprintf(fp, "\r\x1b[2K");
+}
 
-    for (i = 0; i < nbytes - 1; i++) {
-        c = inbyte(ch);
+void redraw_input(FILE *fp, User *u) {
+    fprintf(fp, ">%s", u->input_buffer);
+}
+
+int total_messages_sent = 0;
+
+void send_message(User *sender, const char *msg) {
+    char buf[512];
+    int pos = 0;
+    
+    /* メッセージ送信前に両方の入力行をクリア */
+    pos += sprintf(buf + pos, "\r\x1b[2K");
+    
+    /* メッセージ表示 */
+    pos += sprintf(buf + pos, "%s%s: \x1b[0m%s\n", sender->color, sender->name, msg);
+    
+    /* 一度に出力 */
+    fprintf(com0out, "%s", buf);
+    fprintf(com1out, "%s", buf);
+    
+    /* 入力中だった場合は再表示 */
+    if (user1.is_typing) {
+        redraw_input(com0out, &user1);
+    } else {
+        fprintf(com0out, ">");
+    }
+    
+    if (user2.is_typing) {
+        redraw_input(com1out, &user2);
+    } else {
+        fprintf(com1out, ">");
+    }
+    
+    total_messages_sent++;
+}
+
+void handle_command(User *u, FILE *out_fp, const char *cmd) {
+    if (strncmp(cmd, "/name ", 6) == 0) {
+        P(SCREEN_SEM);
+        strncpy(u->name, cmd + 6, MAX_NAME - 1);
+        u->name[MAX_NAME - 1] = '\0';
         
-        if (c == '\r' || c == '\n') {
-            buf[i] = '\0';
-            return i; // 確定して戻る
-        } else if (c == '\x7f' || c == '\x08') { // Backspace処理
-            if (i > 0) {
-                i -= 2; 
-                fprintf(out_fp, "\b \b");
-            } else {
-                i = -1;
-            }
-            continue;
+        char buf[128];
+        sprintf(buf, "\r\x1b[2K\x1b[33m[System] Name changed to: %s\x1b[0m\n>", u->name);
+        fprintf(out_fp, "%s", buf);
+        V(SCREEN_SEM);
+    }
+    else if (strncmp(cmd, "/color ", 7) == 0) {
+        const char *color_name = cmd + 7;
+        int found = 0;
+        
+        P(SCREEN_SEM);
+        if (strcmp(color_name, "red") == 0) {
+            strcpy(u->color, colors[0]);
+            found = 1;
+        } else if (strcmp(color_name, "green") == 0) {
+            strcpy(u->color, colors[1]);
+            found = 1;
+        } else if (strcmp(color_name, "yellow") == 0) {
+            strcpy(u->color, colors[2]);
+            found = 1;
+        } else if (strcmp(color_name, "blue") == 0) {
+            strcpy(u->color, colors[3]);
+            found = 1;
+        } else if (strcmp(color_name, "magenta") == 0) {
+            strcpy(u->color, colors[4]);
+            found = 1;
+        } else if (strcmp(color_name, "cyan") == 0) {
+            strcpy(u->color, colors[5]);
+            found = 1;
+        } else if (strcmp(color_name, "white") == 0) {
+            strcpy(u->color, colors[6]);
+            found = 1;
+        }
+        
+        if (found) {
+            char buf[128];
+            sprintf(buf, "\r\x1b[2K\x1b[33m[System] Color changed to: %s\x1b[0m\n>", color_name);
+            fprintf(out_fp, "%s", buf);
         } else {
-            buf[i] = c;
-            fputc(c, out_fp); // 入力中のプレビュー表示
+            fprintf(out_fp, "\r\x1b[2K\x1b[33m[System] Unknown color. Available: red, green, yellow, blue, magenta, cyan, white\x1b[0m\n>");
         }
+        V(SCREEN_SEM);
     }
-    return i;
+    else if (strcmp(cmd, "/help") == 0) {
+        P(SCREEN_SEM);
+        fprintf(out_fp, "\r\x1b[2K\x1b[33m[System] Commands:\x1b[0m\n");
+        fprintf(out_fp, "  /name <name> - Change your name\n");
+        fprintf(out_fp, "  /color <color> - Change your color\n");
+        fprintf(out_fp, "  /help - Show this help\n>");
+        V(SCREEN_SEM);
+    }
+    else {
+        P(SCREEN_SEM);
+        fprintf(out_fp, "\r\x1b[2K\x1b[33m[System] Unknown command. Type /help for commands\x1b[0m\n>");
+        V(SCREEN_SEM);
+    }
 }
 
+/* タスク1: ユーザー1の入力処理 */
 void task1() {
-    char line[256];
-    // 初期設定
-    fprintf(com0out, CLS SET_SCROLL GOTO_INPUT_ROW "> ");
-
+    char input_char;
+    
+    fprintf(com0out, "\x1b[2J\x1b[H");
+    fprintf(com0out, "\x1b[33m=== CHAT SYSTEM ===\x1b[0m\n");
+    fprintf(com0out, "\x1b[33mEnter your name > \x1b[0m");
+    fscanf(com0in, "%s", user1.name);
+    fprintf(com0out, "\x1b[33mWelcome, %s!\x1b[0m\n", user1.name);
+    fprintf(com0out, "Type /help for commands\n>");
+    
+    system_ready = 1;
+    
     while (1) {
-        // 入力完了（Enter）まで待機
-        int len = my_read_with_echo(0, line, 256, com0out);
-
-        if (len > 0) {
-            // ログを表示
-            write_log(com0out, "user1", line);
-            write_log(com1out, "user1", line);
+        input_char = fgetc(com0in);
+        
+        P(INPUT_SEM);
+        
+        if (input_char == '\n' || input_char == '\r') {
+            if (user1.input_pos > 0) {
+                user1.input_buffer[user1.input_pos] = '\0';
+                user1.is_typing = 0;
+                
+                if (user1.input_buffer[0] == '/') {
+                    handle_command(&user1, com0out, user1.input_buffer);
+                } else {
+                    P(SCREEN_SEM);
+                    send_message(&user1, user1.input_buffer);
+                    V(SCREEN_SEM);
+                }
+                
+                user1.input_pos = 0;
+                user1.input_buffer[0] = '\0';
+            }
+        } else if (input_char == '\x7f' || input_char == '\x08') {
+            if (user1.input_pos > 0) {
+                user1.input_pos--;
+                user1.input_buffer[user1.input_pos] = '\0';
+                P(SCREEN_SEM);
+                fprintf(com0out, "\x08 \x08");
+                V(SCREEN_SEM);
+            }
+        } else if (input_char >= 32 && input_char <= 126) {
+            /* 印字可能文字（スペース含む）のみ受け付け */
+            if (user1.input_pos < MAX_MSG - 1) {
+                user1.input_buffer[user1.input_pos++] = input_char;
+                user1.input_buffer[user1.input_pos] = '\0';
+                user1.is_typing = 1;
+                P(SCREEN_SEM);
+                fprintf(com0out, "%c", input_char);
+                V(SCREEN_SEM);
+            }
         }
-
-        // --- ここでプレビューを消去 ---
-        // 24行目に移動し、行末まで消してプロンプトを再描画
-        fprintf(com0out, GOTO_INPUT_ROW ERASE_LINE "> ");
+        
+        V(INPUT_SEM);
     }
 }
 
+/* タスク2: ユーザー2の入力処理 */
 void task2() {
-    char line[256];
-    fprintf(com1out, CLS SET_SCROLL GOTO_INPUT_ROW "> ");
-
+    char input_char;
+    
+    while (!system_ready);
+    
+    fprintf(com1out, "\x1b[2J\x1b[H");
+    fprintf(com1out, "\x1b[33m=== CHAT SYSTEM ===\x1b[0m\n");
+    fprintf(com1out, "\x1b[33mEnter your name > \x1b[0m");
+    fscanf(com1in, "%s", user2.name);
+    fprintf(com1out, "\x1b[33mWelcome, %s!\x1b[0m\n", user2.name);
+    fprintf(com1out, "Type /help for commands\n>");
+    
     while (1) {
-        int len = my_read_with_echo(4, line, 256, com1out);
-
-        if (len > 0) {
-            write_log(com0out, "user2", line);
-            write_log(com1out, "user2", line);
+        input_char = fgetc(com1in);
+        
+        P(INPUT_SEM);
+        
+        if (input_char == '\n' || input_char == '\r') {
+            if (user2.input_pos > 0) {
+                user2.input_buffer[user2.input_pos] = '\0';
+                user2.is_typing = 0;
+                
+                if (user2.input_buffer[0] == '/') {
+                    handle_command(&user2, com1out, user2.input_buffer);
+                } else {
+                    P(SCREEN_SEM);
+                    send_message(&user2, user2.input_buffer);
+                    V(SCREEN_SEM);
+                }
+                
+                user2.input_pos = 0;
+                user2.input_buffer[0] = '\0';
+            }
+        } else if (input_char == '\x7f' || input_char == '\x08') {
+            if (user2.input_pos > 0) {
+                user2.input_pos--;
+                user2.input_buffer[user2.input_pos] = '\0';
+                P(SCREEN_SEM);
+                fprintf(com1out, "\x08 \x08");
+                V(SCREEN_SEM);
+            }
+        } else if (input_char >= 32 && input_char <= 126) {
+            /* 印字可能文字（スペース含む）のみ受け付け */
+            if (user2.input_pos < MAX_MSG - 1) {
+                user2.input_buffer[user2.input_pos++] = input_char;
+                user2.input_buffer[user2.input_pos] = '\0';
+                user2.is_typing = 1;
+                P(SCREEN_SEM);
+                fprintf(com1out, "%c", input_char);
+                V(SCREEN_SEM);
+            }
         }
-
-        // プレビュー消去
-        fprintf(com1out, GOTO_INPUT_ROW ERASE_LINE "> ");
+        
+        V(INPUT_SEM);
     }
 }
 
-int main() {
+/* タスク3: 入力状態監視・再描画タスク */
+void task3() {
+    int prev_typing1 = 0;
+    int prev_typing2 = 0;
+    
+    while (1) {
+        for (int i = 0; i < 500000; i++);
+        
+        P(INPUT_SEM);
+        
+        /* 入力状態が変化したら再描画 */
+        if (prev_typing1 != user1.is_typing || prev_typing2 != user2.is_typing) {
+            prev_typing1 = user1.is_typing;
+            prev_typing2 = user2.is_typing;
+        }
+        
+        V(INPUT_SEM);
+    }
+}
+
+
+int main() {    
     fd_mapping();
+    printf("[OK] fd_mapping\n");
+    
     init_kernel();
+    printf("[OK] init_kernel\n");
+    
+    /* セマフォの初期化 */
+    semaphore[SCREEN_SEM].count = 1;
+    semaphore[SCREEN_SEM].nst = 0;
+    semaphore[INPUT_SEM].count = 1;
+    semaphore[INPUT_SEM].nst = 0;
+    
+    /* ユーザー初期化 */
+    init_user(&user1, "User1", colors[1]); /* green */
+    init_user(&user2, "User2", colors[0]); /* red */
+    
+    printf("[OK] Users initialized\n");
     
     set_task(task1);
     set_task(task2);
-
+    set_task(task3);
+    
+    printf("[OK] All tasks set\n");
+    
     begin_sch();
+    
     return 0;
 }
